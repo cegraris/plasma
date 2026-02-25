@@ -354,6 +354,7 @@ set( plasma_src
     compute/zgeqrf.c
     compute/zgeqrs.c
     compute/zgesdd.c
+    compute/zgesdd_stages.c
     compute/zgesv.c
     compute/zgeswp.c
     compute/zgetrf.c
@@ -413,6 +414,7 @@ set( plasma_src
     include/plasma_internal_zc.h
     include/plasma_z.h
     include/plasma_zc.h
+    include/plasma_zgesdd_stages.h
     include/plasma_zlaebz2_work.h
 )
 
