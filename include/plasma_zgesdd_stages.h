@@ -10,7 +10,7 @@
  *
  * Staged interface for complex double-precision SVD (zgesdd).
  *
- * Splits plasma_zgesdd into three independently callable stages:
+ * Splits plasma_zgesdd into four independently callable stages:
  *
  *   Stage 1 - plasma_zgesdd_bidiag_stage1:
  *       Reduce the input matrix A to a banded form (ge2gb).
@@ -19,9 +19,13 @@
  *       Bulge-chase the band to bidiagonal form (gbbrd).
  *
  *   Stage 3 - plasma_zgesdd_dq:
- *       Solve the bidiagonal SVD via divide-and-conquer (bdsdc), then
- *       back-transform the singular vectors through all accumulated
- *       Householder reflectors.
+ *       Solve the bidiagonal SVD via divide-and-conquer (bdsdc) and
+ *       initialise the singular vector matrices pU and pVT.
+ *
+ *   Stage 4 - plasma_zgesdd_backtransform:
+ *       Back-transform the singular vectors through all accumulated
+ *       Householder reflectors (Q2/P2 from bulge chasing, Q1/P1 from
+ *       band reduction).
  *
  * Typical usage from C++:
  *
@@ -29,6 +33,7 @@
  *   plasma_zgesdd_bidiag_stage1(jobu, jobvt, m, n, pA, lda, &ctx);
  *   plasma_zgesdd_bidiag_stage2(&ctx);
  *   plasma_zgesdd_dq(S, pU, ldu, pVT, ldvt, &ctx);
+ *   plasma_zgesdd_backtransform(pU, ldu, pVT, ldvt, &ctx);
  *
  **/
 #ifndef PLASMA_ZGESDD_STAGES_H
@@ -152,16 +157,17 @@ int plasma_zgesdd_bidiag_stage2(plasma_zgesdd_ctx_t *ctx);
 
 /***************************************************************************//**
  *
- * Stage 3: Divide-and-conquer bidiagonal SVD + back-transformation.
+ * Stage 3: Divide-and-conquer bidiagonal SVD.
  *
  * Must be called after plasma_zgesdd_bidiag_stage2.
  * Performs:
- *   1. LAPACKE_dbdsdc   – bidiagonal D&C SVD
- *   2. plasma_pzlarft_blgtrd + plasma_pzunmqr_blgtrd – apply Q2 / P2
- *   3. plasma_pzunmqr / plasma_pzunmlq               – apply Q1 / P1
+ *   1. LAPACKE_dbdsdc – bidiagonal D&C SVD
+ *   2. Initialises pU and pVT with the bidiagonal singular vectors
+ *      (real→complex copy for COMPLEX builds)
  *
- * Frees all internal buffers and descriptors held in ctx on exit
- * (equivalent to calling plasma_zgesdd_ctx_destroy).
+ * On success ctx remains valid and must be passed to
+ * plasma_zgesdd_backtransform (or freed via plasma_zgesdd_ctx_destroy).
+ * On error ctx is freed internally.
  *
  * @param[out] S
  *     Array of at least min(m,n) doubles.
@@ -178,13 +184,56 @@ int plasma_zgesdd_bidiag_stage2(plasma_zgesdd_ctx_t *ctx);
  * @param[in]  ldvt    Leading dimension of pVT.
  *
  * @param[in,out] ctx
- *     Context from stage 2.  Freed internally; do not use after this call.
+ *     Context from stage 2.  On success kept alive for stage 4.
+ *     On error freed internally; do not use after a failing call.
  *
  * @retval PlasmaSuccess on success, negative error code otherwise.
  *
  ******************************************************************************/
 int plasma_zgesdd_dq(
     double *S,
+    plasma_complex64_t *pU,  int ldu,
+    plasma_complex64_t *pVT, int ldvt,
+    plasma_zgesdd_ctx_t *ctx);
+
+/***************************************************************************//**
+ *
+ * Stage 4: Back-transform singular vectors.
+ *
+ * Must be called after plasma_zgesdd_dq.
+ * Performs:
+ *   1. plasma_pzlarft_blgtrd + plasma_pzunmqr_blgtrd – apply Q2 / P2
+ *      (bulge-chasing reflectors)
+ *   2. plasma_pzunmqr / plasma_pzunmlq               – apply Q1 / P1
+ *      (band-reduction reflectors)
+ *
+ * A no-op (other than freeing ctx) when jobu == PlasmaNoVec and
+ * jobvt == PlasmaNoVec.
+ *
+ * Frees all internal buffers and descriptors held in ctx on exit
+ * (equivalent to calling plasma_zgesdd_ctx_destroy).
+ *
+ * @param[in,out] pU
+ *     Left singular-vector matrix, as initialised by plasma_zgesdd_dq.
+ *     On exit contains the fully back-transformed left singular vectors.
+ *     Ignored when jobu == PlasmaNoVec.
+ *
+ * @param[in]  ldu     Leading dimension of pU.
+ *
+ * @param[in,out] pVT
+ *     Right singular-vector matrix (V^H), as initialised by plasma_zgesdd_dq.
+ *     On exit contains the fully back-transformed right singular vectors.
+ *     Ignored when jobvt == PlasmaNoVec.
+ *
+ * @param[in]  ldvt    Leading dimension of pVT.
+ *
+ * @param[in,out] ctx
+ *     Context from stage 3.  Freed internally; do not use after this call.
+ *
+ * @retval PlasmaSuccess on success, negative error code otherwise.
+ *
+ ******************************************************************************/
+int plasma_zgesdd_backtransform(
     plasma_complex64_t *pU,  int ldu,
     plasma_complex64_t *pVT, int ldvt,
     plasma_zgesdd_ctx_t *ctx);

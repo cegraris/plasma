@@ -9,13 +9,14 @@
  * @precisions normal z -> s d c
  *
  * Staged implementation of the complex double-precision SVD.
- * Splits plasma_omp_zgesdd into three separately callable stages so that
+ * Splits plasma_omp_zgesdd into four separately callable stages so that
  * external code can interleave other work (or insert instrumentation) between
  * the major phases of the computation:
  *
- *   Stage 1 (bidiag_stage1) – reduction to banded form
- *   Stage 2 (bidiag_stage2) – bulge-chasing band → bidiagonal
- *   Stage 3 (dq)            – bidiagonal D&C SVD + back-transform
+ *   Stage 1 (bidiag_stage1)  – reduction to banded form
+ *   Stage 2 (bidiag_stage2)  – bulge-chasing band → bidiagonal
+ *   Stage 3 (dq)             – bidiagonal D&C SVD (bdsdc)
+ *   Stage 4 (backtransform)  – back-transform singular vectors
  *
  **/
 
@@ -328,17 +329,18 @@ int plasma_zgesdd_bidiag_stage2(plasma_zgesdd_ctx_t *ctx)
  *
  * @ingroup plasma_gesdd
  *
- * plasma_zgesdd_dq - bidiagonal D&C SVD and back-transformation.
+ * plasma_zgesdd_dq - bidiagonal D&C SVD.
  *
  * Must be called after plasma_zgesdd_bidiag_stage2.
  *
  * Performs:
- *   1. LAPACKE_dbdsdc       – bidiagonal divide-and-conquer SVD
- *   2. larft_blgtrd + unmqr_blgtrd – apply Q2 / P2 (bulge reflectors)
- *   3. unmqr / unmlq               – apply Q1 / P1 (band reflectors)
+ *   1. LAPACKE_dbdsdc – bidiagonal divide-and-conquer SVD
+ *   2. Initialises pU and pVT with the bidiagonal singular vectors
+ *      (real→complex copy for COMPLEX builds)
  *
- * Frees all resources held in ctx before returning (equivalent to
- * calling plasma_zgesdd_ctx_destroy).
+ * On success ctx remains valid and must be passed to
+ * plasma_zgesdd_backtransform (or freed via plasma_zgesdd_ctx_destroy).
+ * On error ctx is freed internally.
  *
  ******************************************************************************/
 int plasma_zgesdd_dq(
@@ -347,21 +349,14 @@ int plasma_zgesdd_dq(
     plasma_complex64_t *pVT, int ldvt,
     plasma_zgesdd_ctx_t *ctx)
 {
-    int retval = PlasmaSuccess;
-
     int m      = ctx->m;
     int n      = ctx->n;
     int minmn  = ctx->minmn;
-    int nb     = ctx->nb;
     int Un     = ctx->Un;
-    int VTm    = ctx->VTm;
-    int wantz  = ctx->wantz;
-    int vblksiz = ctx->vblksiz;
 
     plasma_enum_t jobu  = ctx->jobu;
     plasma_enum_t jobvt = ctx->jobvt;
 
-    /* ---- bidiagonal D&C SVD ---- */
     double rdummy[1];
     int    idummy[1];
     int lapack_info;
@@ -375,8 +370,8 @@ int plasma_zgesdd_dq(
                                      rdummy, idummy);
         if (lapack_info != 0) {
             plasma_error("dbdsdc() failed");
-            retval = PlasmaErrorIllegalValue;
-            goto cleanup;
+            plasma_zgesdd_ctx_destroy(ctx);
+            return PlasmaErrorIllegalValue;
         }
         /* Copy singular values to caller's buffer. */
         memcpy(S, ctx->S_bidiag, minmn * sizeof(double));
@@ -413,8 +408,8 @@ int plasma_zgesdd_dq(
             plasma_error("malloc RU or RVT failed");
             free(RU);
             free(RVT);
-            retval = PlasmaErrorOutOfMemory;
-            goto cleanup;
+            plasma_zgesdd_ctx_destroy(ctx);
+            return PlasmaErrorOutOfMemory;
         }
 
         lapack_info = LAPACKE_dbdsdc(LAPACK_COL_MAJOR, ctx->lapack_uplo, 'I',
@@ -441,142 +436,179 @@ int plasma_zgesdd_dq(
 #endif
         if (lapack_info != 0) {
             plasma_error("dbdsdc() failed");
-            retval = PlasmaErrorIllegalValue;
-            goto cleanup;
+            plasma_zgesdd_ctx_destroy(ctx);
+            return PlasmaErrorIllegalValue;
         }
 
         /* Copy singular values to caller's buffer. */
         memcpy(S, ctx->S_bidiag, minmn * sizeof(double));
+    }
 
-        /* ================================================
-         * Back-transform U = Q1 Q2 U0
-         * ================================================ */
-        if (jobu == PlasmaAllVec || jobu == PlasmaSomeVec) {
-            /* Step 1: compute T2 for Q2 */
-            #pragma omp parallel
-            {
-                plasma_pzlarft_blgtrd(minmn, nb, vblksiz,
-                                      ctx->VQ2, ctx->TQ2, ctx->tauQ2,
-                                      &ctx->sequence, &ctx->request);
-            }
+    return PlasmaSuccess;
+}
 
-            /* Step 2: apply Q2 (from bulge chasing) to U */
-            #pragma omp parallel
-            {
-                plasma_pzunmqr_blgtrd(PlasmaLeft, PlasmaNoTrans,
-                                      minmn, nb, minmn, vblksiz, wantz,
-                                      ctx->VQ2, ctx->TQ2, ctx->tauQ2,
-                                      pU, ldu,
-                                      ctx->work,
-                                      &ctx->sequence, &ctx->request);
-            }
+/***************************************************************************//**
+ *
+ * @ingroup plasma_gesdd
+ *
+ * plasma_zgesdd_backtransform - back-transform singular vectors.
+ *
+ * Must be called after plasma_zgesdd_dq.
+ *
+ * Performs:
+ *   1. larft_blgtrd + unmqr_blgtrd – apply Q2 / P2 (bulge reflectors)
+ *   2. unmqr / unmlq               – apply Q1 / P1 (band reflectors)
+ *
+ * Frees all resources held in ctx before returning (equivalent to
+ * calling plasma_zgesdd_ctx_destroy).
+ *
+ ******************************************************************************/
+int plasma_zgesdd_backtransform(
+    plasma_complex64_t *pU,  int ldu,
+    plasma_complex64_t *pVT, int ldvt,
+    plasma_zgesdd_ctx_t *ctx)
+{
+    int retval = PlasmaSuccess;
 
-            /* Step 3: apply Q1 (from band reduction) to U */
-            plasma_desc_t U;
-            plasma_desc_general_create(PlasmaComplexDouble, nb, nb,
-                                       m, Un, 0, 0, m, Un, &U);
+    int m       = ctx->m;
+    int n       = ctx->n;
+    int minmn   = ctx->minmn;
+    int nb      = ctx->nb;
+    int Un      = ctx->Un;
+    int VTm     = ctx->VTm;
+    int wantz   = ctx->wantz;
+    int vblksiz = ctx->vblksiz;
 
-            #pragma omp parallel
-            #pragma omp master
-            {
-                /* Translate U to tile layout. */
-                plasma_pzge2desc(pU, ldu, U, &ctx->sequence, &ctx->request);
+    plasma_enum_t jobu  = ctx->jobu;
+    plasma_enum_t jobvt = ctx->jobvt;
 
-                if (m < n) {
-                    plasma_pzunmqr(
-                        PlasmaLeft, PlasmaNoTrans,
-                        plasma_desc_view(ctx->A,
-                                         ctx->A.mb, 0,
-                                         ctx->A.m - ctx->A.mb,
-                                         ctx->A.n - ctx->A.nb),
-                        plasma_desc_view(ctx->T,
-                                         ctx->T.mb, 0,
-                                         ctx->T.m - ctx->T.mb,
-                                         ctx->T.n - ctx->T.nb),
-                        plasma_desc_view(U, U.mb, 0, U.m - U.mb, U.n),
-                        ctx->work, &ctx->sequence, &ctx->request);
-                }
-                else {
-                    plasma_pzunmqr(PlasmaLeft, PlasmaNoTrans,
-                                   ctx->A, ctx->T, U,
-                                   ctx->work, &ctx->sequence, &ctx->request);
-                }
-
-                /* Translate U back to LAPACK layout. */
-                plasma_pzdesc2ge(U, pU, ldu, &ctx->sequence, &ctx->request);
-            }
-
-            plasma_desc_destroy(&U);
+    /* ================================================
+     * Back-transform U = Q1 Q2 U0
+     * ================================================ */
+    if (jobu == PlasmaAllVec || jobu == PlasmaSomeVec) {
+        /* Step 1: compute T2 for Q2 */
+        #pragma omp parallel
+        {
+            plasma_pzlarft_blgtrd(minmn, nb, vblksiz,
+                                  ctx->VQ2, ctx->TQ2, ctx->tauQ2,
+                                  &ctx->sequence, &ctx->request);
         }
 
-        /* ================================================
-         * Back-transform VT = V0^H P2^H P1^H
-         * ================================================ */
-        if (jobvt == PlasmaAllVec || jobvt == PlasmaSomeVec) {
-            /* Step 1: compute T2 for P2 */
-            #pragma omp parallel
-            {
-                plasma_pzlarft_blgtrd(minmn, nb, vblksiz,
-                                      ctx->VP2, ctx->TP2, ctx->tauP2,
-                                      &ctx->sequence, &ctx->request);
-            }
-
-            /* Step 2: apply P2 (from bulge chasing) to VT */
-            #pragma omp parallel
-            {
-                plasma_pzunmqr_blgtrd(PlasmaRight, PlasmaConjTrans,
-                                      minmn, nb, minmn, vblksiz, wantz,
-                                      ctx->VP2, ctx->TP2, ctx->tauP2,
-                                      pVT, ldvt,
-                                      ctx->work,
-                                      &ctx->sequence, &ctx->request);
-            }
-
-            /* Step 3: apply P1 (from band reduction) to VT */
-            plasma_desc_t VT;
-            plasma_desc_general_create(PlasmaComplexDouble, nb, nb,
-                                       VTm, n, 0, 0, VTm, n, &VT);
-
-            #pragma omp parallel
-            #pragma omp master
-            {
-                /* Translate VT to tile layout. */
-                plasma_pzge2desc(pVT, ldvt, VT, &ctx->sequence, &ctx->request);
-
-                if (m < n) {
-                    plasma_pzunmlq(PlasmaRight, PlasmaNoTrans,
-                                   ctx->A, ctx->T, VT,
-                                   ctx->work, &ctx->sequence, &ctx->request);
-                }
-                else {
-                    plasma_pzunmlq(
-                        PlasmaRight, PlasmaNoTrans,
-                        plasma_desc_view(ctx->A,
-                                         0, ctx->A.nb,
-                                         ctx->A.m - ctx->A.mb,
-                                         ctx->A.n - ctx->A.nb),
-                        plasma_desc_view(ctx->T,
-                                         0, ctx->T.nb,
-                                         ctx->T.m - ctx->T.mb,
-                                         ctx->T.n - ctx->T.nb),
-                        plasma_desc_view(VT,
-                                         0, VT.nb,
-                                         VT.m,
-                                         VT.n - VT.nb),
-                        ctx->work, &ctx->sequence, &ctx->request);
-                }
-
-                /* Translate VT back to LAPACK layout. */
-                plasma_pzdesc2ge(VT, pVT, ldvt, &ctx->sequence, &ctx->request);
-            }
-
-            plasma_desc_destroy(&VT);
+        /* Step 2: apply Q2 (from bulge chasing) to U */
+        #pragma omp parallel
+        {
+            plasma_pzunmqr_blgtrd(PlasmaLeft, PlasmaNoTrans,
+                                  minmn, nb, minmn, vblksiz, wantz,
+                                  ctx->VQ2, ctx->TQ2, ctx->tauQ2,
+                                  pU, ldu,
+                                  ctx->work,
+                                  &ctx->sequence, &ctx->request);
         }
+
+        /* Step 3: apply Q1 (from band reduction) to U */
+        plasma_desc_t U;
+        plasma_desc_general_create(PlasmaComplexDouble, nb, nb,
+                                   m, Un, 0, 0, m, Un, &U);
+
+        #pragma omp parallel
+        #pragma omp master
+        {
+            /* Translate U to tile layout. */
+            plasma_pzge2desc(pU, ldu, U, &ctx->sequence, &ctx->request);
+
+            if (m < n) {
+                plasma_pzunmqr(
+                    PlasmaLeft, PlasmaNoTrans,
+                    plasma_desc_view(ctx->A,
+                                     ctx->A.mb, 0,
+                                     ctx->A.m - ctx->A.mb,
+                                     ctx->A.n - ctx->A.nb),
+                    plasma_desc_view(ctx->T,
+                                     ctx->T.mb, 0,
+                                     ctx->T.m - ctx->T.mb,
+                                     ctx->T.n - ctx->T.nb),
+                    plasma_desc_view(U, U.mb, 0, U.m - U.mb, U.n),
+                    ctx->work, &ctx->sequence, &ctx->request);
+            }
+            else {
+                plasma_pzunmqr(PlasmaLeft, PlasmaNoTrans,
+                               ctx->A, ctx->T, U,
+                               ctx->work, &ctx->sequence, &ctx->request);
+            }
+
+            /* Translate U back to LAPACK layout. */
+            plasma_pzdesc2ge(U, pU, ldu, &ctx->sequence, &ctx->request);
+        }
+
+        plasma_desc_destroy(&U);
+    }
+
+    /* ================================================
+     * Back-transform VT = V0^H P2^H P1^H
+     * ================================================ */
+    if (jobvt == PlasmaAllVec || jobvt == PlasmaSomeVec) {
+        /* Step 1: compute T2 for P2 */
+        #pragma omp parallel
+        {
+            plasma_pzlarft_blgtrd(minmn, nb, vblksiz,
+                                  ctx->VP2, ctx->TP2, ctx->tauP2,
+                                  &ctx->sequence, &ctx->request);
+        }
+
+        /* Step 2: apply P2 (from bulge chasing) to VT */
+        #pragma omp parallel
+        {
+            plasma_pzunmqr_blgtrd(PlasmaRight, PlasmaConjTrans,
+                                  minmn, nb, minmn, vblksiz, wantz,
+                                  ctx->VP2, ctx->TP2, ctx->tauP2,
+                                  pVT, ldvt,
+                                  ctx->work,
+                                  &ctx->sequence, &ctx->request);
+        }
+
+        /* Step 3: apply P1 (from band reduction) to VT */
+        plasma_desc_t VT;
+        plasma_desc_general_create(PlasmaComplexDouble, nb, nb,
+                                   VTm, n, 0, 0, VTm, n, &VT);
+
+        #pragma omp parallel
+        #pragma omp master
+        {
+            /* Translate VT to tile layout. */
+            plasma_pzge2desc(pVT, ldvt, VT, &ctx->sequence, &ctx->request);
+
+            if (m < n) {
+                plasma_pzunmlq(PlasmaRight, PlasmaNoTrans,
+                               ctx->A, ctx->T, VT,
+                               ctx->work, &ctx->sequence, &ctx->request);
+            }
+            else {
+                plasma_pzunmlq(
+                    PlasmaRight, PlasmaNoTrans,
+                    plasma_desc_view(ctx->A,
+                                     0, ctx->A.nb,
+                                     ctx->A.m - ctx->A.mb,
+                                     ctx->A.n - ctx->A.nb),
+                    plasma_desc_view(ctx->T,
+                                     0, ctx->T.nb,
+                                     ctx->T.m - ctx->T.mb,
+                                     ctx->T.n - ctx->T.nb),
+                    plasma_desc_view(VT,
+                                     0, VT.nb,
+                                     VT.m,
+                                     VT.n - VT.nb),
+                    ctx->work, &ctx->sequence, &ctx->request);
+            }
+
+            /* Translate VT back to LAPACK layout. */
+            plasma_pzdesc2ge(VT, pVT, ldvt, &ctx->sequence, &ctx->request);
+        }
+
+        plasma_desc_destroy(&VT);
     }
 
     retval = ctx->sequence.status;
 
-cleanup:
     plasma_zgesdd_ctx_destroy(ctx);
     return retval;
 }
