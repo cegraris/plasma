@@ -10,10 +10,18 @@
  *
  * Staged interface for complex double-precision SVD (zgesdd).
  *
- * Splits plasma_zgesdd into four independently callable stages:
+ * Splits plasma_zgesdd into five independently callable stages:
+ *
+ *   Stage 0 - plasma_zgesdd_init:
+ *       Validate arguments, populate the context, create PLASMA descriptors
+ *       and workspace, allocate all intermediate buffers, and translate the
+ *       input matrix A into tile layout (ge2desc).  Contains one-time
+ *       initialisation overhead; exclude from Roofline / performance analysis.
  *
  *   Stage 1 - plasma_zgesdd_bidiag_stage1:
- *       Reduce the input matrix A to a banded form (ge2gb).
+ *       Reduce the input matrix A to a banded form (ge2gb) and copy to
+ *       LAPACK band layout (gecpy_tile2lapack_band).  Pure computation;
+ *       suitable for performance analysis.
  *
  *   Stage 2 - plasma_zgesdd_bidiag_stage2:
  *       Bulge-chase the band to bidiagonal form (gbbrd).
@@ -30,7 +38,8 @@
  * Typical usage from C++:
  *
  *   plasma_zgesdd_ctx_t ctx;
- *   plasma_zgesdd_bidiag_stage1(jobu, jobvt, m, n, pA, lda, &ctx);
+ *   plasma_zgesdd_init(jobu, jobvt, m, n, pA, lda, &ctx);
+ *   plasma_zgesdd_bidiag_stage1(&ctx);
  *   plasma_zgesdd_bidiag_stage2(&ctx);
  *   plasma_zgesdd_dq(S, pU, ldu, pVT, ldvt, &ctx);
  *   plasma_zgesdd_backtransform(pU, ldu, pVT, ldvt, &ctx);
@@ -50,10 +59,10 @@ extern "C" {
 
 /***************************************************************************//**
  *
- * Context structure that carries intermediate SVD state between the three
+ * Context structure that carries intermediate SVD state between the five
  * pipeline stages.  The caller allocates the struct (stack or heap); its
- * contents are initialised by plasma_zgesdd_bidiag_stage1 and released by
- * plasma_zgesdd_dq (or plasma_zgesdd_ctx_destroy on early exit).
+ * contents are initialised by plasma_zgesdd_init and released by
+ * plasma_zgesdd_backtransform (or plasma_zgesdd_ctx_destroy on early exit).
  *
  ******************************************************************************/
 typedef struct {
@@ -99,11 +108,14 @@ typedef struct {
 
 /***************************************************************************//**
  *
- * Stage 1: Reduction to banded form.
+ * Stage 0: Initialisation (excluded from performance analysis).
  *
- * Translates pA into tile layout, creates all descriptors and workspace,
- * allocates intermediate buffers, and performs the reduction A → Band
- * (plasma_pzge2gb + plasma_pzgecpy_tile2lapack_band).
+ * Validates arguments, populates the context, creates PLASMA descriptors and
+ * workspace, allocates all intermediate buffers, and translates the input
+ * matrix A into tile layout (plasma_pzge2desc).
+ *
+ * This stage contains one-time setup overhead and should NOT be included in
+ * Roofline or performance counter measurements.
  *
  * @param[in]  jobu
  *     PlasmaAllVec / PlasmaSomeVec / PlasmaNoVec
@@ -116,7 +128,7 @@ typedef struct {
  *
  * @param[in,out] pA
  *     m-by-n matrix in column-major (LAPACK) layout.
- *     On exit the contents are destroyed.
+ *     On exit the contents are destroyed (overwritten by tile layout).
  *
  * @param[in]  lda
  *     Leading dimension of pA.  lda >= max(1, m).
@@ -124,16 +136,35 @@ typedef struct {
  * @param[out] ctx
  *     Caller-allocated context.  Zero-initialised internally on entry.
  *     Must not be freed by the caller; use plasma_zgesdd_ctx_destroy or
- *     let plasma_zgesdd_dq release resources on success.
+ *     let plasma_zgesdd_backtransform release resources on success.
  *
  * @retval PlasmaSuccess on success, negative error code otherwise.
  *
  ******************************************************************************/
-int plasma_zgesdd_bidiag_stage1(
+int plasma_zgesdd_init(
     plasma_enum_t jobu, plasma_enum_t jobvt,
     int m, int n,
     plasma_complex64_t *pA, int lda,
     plasma_zgesdd_ctx_t *ctx);
+
+/***************************************************************************//**
+ *
+ * Stage 1: Reduction to banded form (pure computation).
+ *
+ * Must be called after plasma_zgesdd_init.
+ * Performs the tile reduction A → Band (plasma_pzge2gb) and copies the
+ * result to LAPACK band layout (plasma_pzgecpy_tile2lapack_band).
+ *
+ * This stage contains no initialisation overhead and is suitable for
+ * Roofline / performance counter measurements.
+ *
+ * @param[in,out] ctx
+ *     Context initialised by plasma_zgesdd_init.
+ *
+ * @retval PlasmaSuccess on success, negative error code otherwise.
+ *
+ ******************************************************************************/
+int plasma_zgesdd_bidiag_stage1(plasma_zgesdd_ctx_t *ctx);
 
 /***************************************************************************//**
  *

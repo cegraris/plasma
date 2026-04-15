@@ -9,11 +9,13 @@
  * @precisions normal z -> s d c
  *
  * Staged implementation of the complex double-precision SVD.
- * Splits plasma_omp_zgesdd into four separately callable stages so that
+ * Splits plasma_omp_zgesdd into five separately callable stages so that
  * external code can interleave other work (or insert instrumentation) between
  * the major phases of the computation:
  *
- *   Stage 1 (bidiag_stage1)  – reduction to banded form
+ *   Stage 0 (init)           – argument checks, descriptors, buffer allocation,
+ *                              tile layout conversion (ge2desc); init overhead only
+ *   Stage 1 (bidiag_stage1)  – reduction to banded form (pure computation)
  *   Stage 2 (bidiag_stage2)  – bulge-chasing band → bidiagonal
  *   Stage 3 (dq)             – bidiagonal D&C SVD (bdsdc)
  *   Stage 4 (backtransform)  – back-transform singular vectors
@@ -69,18 +71,17 @@ void plasma_zgesdd_ctx_destroy(plasma_zgesdd_ctx_t *ctx)
  *
  * @ingroup plasma_gesdd
  *
- * plasma_zgesdd_bidiag_stage1 - reduce A to banded form.
+ * plasma_zgesdd_init - Stage 0: initialisation (excluded from perf analysis).
  *
- * Translates pA into tile layout, creates all PLASMA descriptors and
- * workspace, allocates intermediate buffers, and performs:
+ * Validates arguments, populates the context, creates all PLASMA descriptors
+ * and workspace, allocates intermediate buffers, and translates pA into tile
+ * layout (plasma_pzge2desc).
  *
- *   plasma_pzge2gb               (tile reduction to band)
- *   plasma_pzgecpy_tile2lapack_band  (copy tile band → LAPACK band layout)
- *
- * On return ctx holds everything needed by stage 2.
+ * Contains one-time setup overhead; do NOT include in Roofline measurements.
+ * On return ctx holds everything needed by plasma_zgesdd_bidiag_stage1.
  *
  ******************************************************************************/
-int plasma_zgesdd_bidiag_stage1(
+int plasma_zgesdd_init(
     plasma_enum_t jobu, plasma_enum_t jobvt,
     int m, int n,
     plasma_complex64_t *pA, int lda,
@@ -282,6 +283,28 @@ int plasma_zgesdd_bidiag_stage1(
         memset(ctx->tauP2, 0, 2 * minmn * sizeof(plasma_complex64_t));
         memset(ctx->VP2,   0, 2 * minmn * sizeof(plasma_complex64_t));
     }
+
+    return ctx->sequence.status;
+}
+
+/***************************************************************************//**
+ *
+ * @ingroup plasma_gesdd
+ *
+ * plasma_zgesdd_bidiag_stage1 - Stage 1: reduce A to banded form (pure computation).
+ *
+ * Must be called after plasma_zgesdd_init.
+ * Performs:
+ *   plasma_pzge2gb                   (tile reduction to band)
+ *   plasma_pzgecpy_tile2lapack_band  (copy tile band → LAPACK band layout)
+ *
+ * Contains no initialisation overhead; suitable for Roofline measurements.
+ * On return ctx holds everything needed by plasma_zgesdd_bidiag_stage2.
+ *
+ ******************************************************************************/
+int plasma_zgesdd_bidiag_stage1(plasma_zgesdd_ctx_t *ctx)
+{
+    int nb = ctx->nb;
 
     /* ---- reduction to band ---- */
     #pragma omp parallel
